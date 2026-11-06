@@ -1,0 +1,404 @@
+```react
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  updateDoc 
+} from 'firebase/firestore';
+
+// --- FIREBASE INITIALIZATION ---
+let app, auth, db;
+const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'ibp-empire-warroom-default';
+
+if (firebaseConfigStr) {
+  try {
+    const firebaseConfig = JSON.parse(firebaseConfigStr);
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  } catch (e) {
+    console.error("Firebase initialization failed:", e);
+  }
+}
+
+// Default initial state for the game
+const INITIAL_GAME_STATE = {
+  activeRound: 0, // 0 to 5
+  roundTimer: 900, // seconds for Ronda 0 (15 min)
+  isTimerRunning: false,
+  tickerMessage: "BIENVENIDOS A IBP EMPIRE WARROOM - INICIANDO SESIÓN DE SIMULACIÓN ESTRATÉGICA",
+  marketEvent: null,
+  teams: {
+    team1: { name: "Nexus Corp", color: "#00F0FF", score: 1000, otif: 82, forecastAccuracy: 75, ebitda: 14.2, inventoryTurn: 4.1, currentPhase: 1, ShieldActive: false },
+    team2: { name: "CyberLogix", color: "#10B981", score: 980, otif: 80, forecastAccuracy: 72, ebitda: 13.8, inventoryTurn: 3.8, currentPhase: 1, ShieldActive: false },
+    team3: { name: "Apex Logistics", color: "#F59E0B", score: 1020, otif: 85, forecastAccuracy: 78, ebitda: 15.0, inventoryTurn: 4.5, currentPhase: 1, ShieldActive: false },
+    team4: { name: "Veloce Supply", color: "#EC4899", score: 950, otif: 79, forecastAccuracy: 70, ebitda: 13.0, inventoryTurn: 3.6, currentPhase: 1, ShieldActive: false }
+  },
+  missionAnswers: {}
+};
+
+const ROUNDS_CONFIG = [
+  { id: 0, name: "Ronda 0: Briefing & Alineación Estratégica", duration: 900, desc: "Registro de equipos, tutorial del sistema IBP y definición del horizonte de 18-36 meses." },
+  { id: 1, name: "Ronda 1: Evolución Cadena - Del MRP al IBP", duration: 1200, desc: "Desafío conceptual y diagnóstico: identificar brechas entre MRP, S&OP e IBP para resolver cuellos de botella." },
+  { id: 2, name: "Ronda 2: El Ciclo Mensual IBP (5 Fases)", duration: 1800, desc: "Simulación de las 5 fases: Producto, Demanda, Suministro, Conciliación Financiera y Reunión Ejecutiva." },
+  { id: 3, name: "Ronda 3: Tormenta de Mercado & Crisis", duration: 1500, desc: "Gestión de disrupciones globales inesperadas (bloqueos, escasez de chips, volatilidad cambiaría)." },
+  { id: 4, name: "Ronda 4: Herramientas Tecnológicas & Cambio", duration: 1200, desc: "Selección e implementación de plataformas (SAP IBP, Kinaxis, Anaplan, o9, Oracle) y gestión del cambio." },
+  { id: 5, name: "Ronda 5: Gran Cierre & Podio de Victoria", duration: 600, desc: "Evaluación final de KPIs (OTIF, Precisión de Pronóstico, EBITDA) y coronación del campeón de IBP." }
+];
+
+export default function App() {
+  // App view modes: 'projector' | 'moderator' | 'player'
+  const [viewMode, setViewMode] = useState('projector');
+  const [user, setUser] = useState(null);
+  const [gameState, setGameState] = useState(INITIAL_GAME_STATE);
+  const [selectedTeamId, setSelectedTeamId] = useState('team1');
+
+  // Interactive state for team answers inside missions
+  const [demandSlider, setDemandSlider] = useState(100);
+  const [capacitySlider, setCapacitySlider] = useState(85);
+  const [bufferSlider, setBufferSlider] = useState(15);
+  const [selectedTool, setSelectedTool] = useState('');
+  const [missionSubmitted, setMissionSubmitted] = useState(false);
+
+  // Auth setup
+  useEffect(() => {
+    if (!auth) return;
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth error:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore sync setup
+  useEffect(() => {
+    if (!db || !user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'ibp_game_room', 'current');
+    
+    // Subscribe to live changes
+    const unsubscribe = onSnapshot(roomRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setGameState(snapshot.data());
+      } else {
+        // Initialize doc if missing
+        setDoc(roomRef, INITIAL_GAME_STATE).catch(console.error);
+      }
+    }, (error) => {
+      console.warn("Firestore snapshot error (using local state fallback):", error);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Master Timer Tick (Run by Moderator or active tab)
+  useEffect(() => {
+    let interval = null;
+    if (gameState.isTimerRunning && gameState.roundTimer > 0) {
+      interval = setInterval(() => {
+        setGameState(prev => {
+          const nextTimer = prev.roundTimer - 1;
+          const updated = { ...prev, roundTimer: nextTimer };
+          // Push update if Firestore active & user is moderator
+          if (db && user && viewMode === 'moderator') {
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'ibp_game_room', 'current');
+            updateDoc(roomRef, { roundTimer: nextTimer }).catch(() => {});
+          }
+          return updated;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [gameState.isTimerRunning, gameState.roundTimer, viewMode, user]);
+
+  // Helper to sync state changes to Firestore
+  const syncState = async (newState) => {
+    setGameState(newState);
+    if (db && user) {
+      try {
+        const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'ibp_game_room', 'current');
+        await setDoc(roomRef, newState, { merge: true });
+      } catch (err) {
+        console.error("Failed to sync to cloud:", err);
+      }
+    }
+  };
+
+  // Moderator actions
+  const toggleTimer = () => {
+    syncState({ ...gameState, isTimerRunning: !gameState.isTimerRunning });
+  };
+
+  const changeRound = (roundIndex) => {
+    const roundInfo = ROUNDS_CONFIG[roundIndex];
+    syncState({
+      ...gameState,
+      activeRound: roundIndex,
+      roundTimer: roundInfo.duration,
+      isTimerRunning: false,
+      tickerMessage: `INICIANDO ${roundInfo.name.toUpperCase()} - ${roundInfo.desc}`
+    });
+    setMissionSubmitted(false);
+  };
+
+  const triggerMarketDisruption = (type) => {
+    let msg = "";
+    let impact = {};
+    if (type === 'suez') {
+      msg = "¡CRISIS GLOBAL! Bloqueo del Canal de Suez interrumpe envíos. Tiempos de entrega +40%.";
+      impact = { otif: -15, ebitda: -2.5 };
+    } else if (type === 'chips') {
+      msg = "¡ESCASEZ DE SEMICONDUCTORES! La capacidad de suministro global cae un 30%.";
+      impact = { inventoryTurn: -1.2, otif: -10 };
+    } else if (type === 'inflation') {
+      msg = "¡PICO INFLACIONARIO! Costos de materia prima aumentan 25%. Ajuste su conciliación financiera.";
+      impact = { ebitda: -4.0 };
+    } else if (type === 'rubberband') {
+      msg = "¡VENTURE CAPITAL GRANT! El equipo rezagado recibe subsidio de optimización logística (+150 pts).";
+    }
+
+    // Apply impact to teams
+    const updatedTeams = { ...gameState.teams };
+    Object.keys(updatedTeams).forEach(id => {
+      if (type === 'rubberband') {
+        // Find team with lowest score
+        const lowestId = Object.keys(updatedTeams).reduce((a, b) => updatedTeams[a].score < updatedTeams[b].score ? a : b);
+        if (id === lowestId) updatedTeams[id].score += 150;
+      } else {
+        if (!updatedTeams[id].ShieldActive) {
+          if (impact.otif) updatedTeams[id].otif = Math.max(40, updatedTeams[id].otif + impact.otif);
+          if (impact.ebitda) updatedTeams[id].ebitda = Math.max(2, parseFloat((updatedTeams[id].ebitda + impact.ebitda).toFixed(1)));
+          if (impact.inventoryTurn) updatedTeams[id].inventoryTurn = Math.max(1, parseFloat((updatedTeams[id].inventoryTurn + impact.inventoryTurn).toFixed(1)));
+          updatedTeams[id].score = Math.max(0, updatedTeams[id].score - 50);
+        }
+      }
+    });
+
+    syncState({
+      ...gameState,
+      tickerMessage: msg,
+      marketEvent: type,
+      teams: updatedTeams
+    });
+  };
+
+  const updateTeamScore = (teamId, delta) => {
+    const updatedTeams = { ...gameState.teams };
+    if (updatedTeams[teamId]) {
+      updatedTeams[teamId].score = Math.max(0, updatedTeams[teamId].score + delta);
+      // Improve KPIs on positive points
+      if (delta > 0) {
+        updatedTeams[teamId].otif = Math.min(99, updatedTeams[teamId].otif + 2);
+        updatedTeams[teamId].forecastAccuracy = Math.min(98, updatedTeams[teamId].forecastAccuracy + 2);
+      }
+    }
+    syncState({ ...gameState, teams: updatedTeams });
+  };
+
+  const handlePlayerMissionSubmit = (points, kpiBoost) => {
+    const updatedTeams = { ...gameState.teams };
+    const cur = updatedTeams[selectedTeamId];
+    if (cur) {
+      cur.score += points;
+      if (kpiBoost.otif) cur.otif = Math.min(99, cur.otif + kpiBoost.otif);
+      if (kpiBoost.accuracy) cur.forecastAccuracy = Math.min(99, cur.forecastAccuracy + kpiBoost.accuracy);
+      if (kpiBoost.ebitda) cur.ebitda = Math.min(30, parseFloat((cur.ebitda + kpiBoost.ebitda).toFixed(1)));
+    }
+    syncState({
+      ...gameState,
+      teams: updatedTeams,
+      tickerMessage: `¡${cur.name} ha completado la misión estratégica exitosamente! (+${points} pts)`
+    });
+    setMissionSubmitted(true);
+  };
+
+  // Format seconds into MM:SS
+  const formatTime = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // Sort teams for Leaderboard
+  const sortedTeams = Object.entries(gameState.teams)
+    .map(([id, data]) => ({ id, ...data }))
+    .sort((a, b) => b.score - a.score);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans select-none flex flex-col">
+      {/* HEADER / NAVIGATION BAR */}
+      <header className="bg-slate-900/90 backdrop-blur border-b border-cyan-500/30 px-4 py-3 flex flex-wrap justify-between items-center z-50">
+        <div className="flex items-center space-x-3">
+          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center font-black text-xl shadow-lg shadow-cyan-500/30">
+            IBP
+          </div>
+          <div>
+            <h1 className="text-lg font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-emerald-400">
+              IBP EMPIRE: WARROOM
+            </h1>
+            <p className="text-xs text-slate-400">Simulador Multijugador de Integrated Business Planning (120 Min)</p>
+          </div>
+        </div>
+
+        {/* VIEW SELECTOR SWITCH */}
+        <div className="flex bg-slate-800/80 p-1 rounded-xl border border-slate-700 my-2 sm:my-0">
+          <button 
+            onClick={() => setViewMode('projector')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${viewMode === 'projector' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/40' : 'text-slate-400 hover:text-white'}`}
+          >
+            📺 Pantalla Principal (Proyector)
+          </button>
+          <button 
+            onClick={() => setViewMode('moderator')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${viewMode === 'moderator' ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/40' : 'text-slate-400 hover:text-white'}`}
+          >
+            🎮 Panel Moderadores
+          </button>
+          <button 
+            onClick={() => setViewMode('player')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${viewMode === 'player' ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/40' : 'text-slate-400 hover:text-white'}`}
+          >
+            📱 Vista Estudiante (Móvil/PC)
+          </button>
+        </div>
+
+        {/* TIMER DISPLAY */}
+        <div className="flex items-center space-x-3 bg-slate-950/80 border border-slate-800 px-4 py-1.5 rounded-xl">
+          <div className="text-right">
+            <span className="text-[10px] uppercase tracking-widest text-slate-400 block">Tiempo Restante</span>
+            <span className={`font-mono text-xl font-black ${gameState.roundTimer < 180 ? 'text-red-500 animate-pulse' : 'text-cyan-400'}`}>
+              {formatTime(gameState.roundTimer)}
+            </span>
+          </div>
+          <div className={`w-3 h-3 rounded-full ${gameState.isTimerRunning ? 'bg-emerald-500 animate-ping' : 'bg-red-500'}`} />
+        </div>
+      </header>
+
+      {/* TICKER MARQUEE */}
+      <div className="bg-slate-900/60 border-b border-slate-800 py-1.5 px-4 overflow-hidden flex items-center">
+        <span className="bg-cyan-500/20 text-cyan-300 text-[10px] font-bold px-2 py-0.5 rounded mr-3 uppercase tracking-wider shrink-0">
+          EVENTOS EN VIVO
+        </span>
+        <div className="text-xs text-slate-300 font-medium whitespace-nowrap animate-marquee">
+          {gameState.tickerMessage}
+        </div>
+      </div>
+
+      {/* BODY CONTENT AREA */}
+      <main className="flex-1 p-4 md:p-6 overflow-y-auto">
+        {/* ========================================================= */}
+        {/* VIEW 1: BIG SCREEN PROJECTOR / BEAM DISPLAY              */}
+        {/* ========================================================= */}
+        {viewMode === 'projector' && (
+          <div className="max-w-7xl mx-auto space-y-6">
+            {/* Header Stage Info */}
+            <div className="bg-slate-900/80 rounded-2xl p-6 border border-slate-800 backdrop-blur shadow-2xl flex flex-col md:flex-row justify-between items-center gap-4">
+              <div>
+                <span className="text-xs font-bold text-cyan-400 uppercase tracking-widest bg-cyan-500/10 px-3 py-1 rounded-full border border-cyan-500/30">
+                  {ROUNDS_CONFIG[gameState.activeRound].name}
+                </span>
+                <h2 className="text-2xl md:text-3xl font-black mt-2 text-white">
+                  Horizonte Estratégico IBP: 18 a 36 Meses
+                </h2>
+                <p className="text-slate-400 text-sm mt-1">
+                  {ROUNDS_CONFIG[gameState.activeRound].desc}
+                </p>
+              </div>
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 text-center min-w-[200px]">
+                <span className="text-xs text-slate-400 block mb-1">Ronda Activa</span>
+                <span className="text-3xl font-black text-amber-400">{gameState.activeRound} / 5</span>
+              </div>
+            </div>
+
+            {/* Special Final Podium Display when in Round 5 */}
+            {gameState.activeRound === 5 ? (
+              <div className="bg-slate-900/90 rounded-2xl p-8 border border-amber-500/30 text-center space-y-8 animate-fade-in shadow-2xl relative overflow-hidden">
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-96 h-96 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />
+                
+                <h2 className="text-4xl font-black tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-amber-300 via-yellow-400 to-amber-500">
+                  🏆 GRAN PODIO FINAL - CAMPEONES DE IBP EMPIRE 🏆
+                </h2>
+
+                <div className="flex justify-center items-end gap-4 md:gap-8 pt-12 pb-6">
+                  {/* 2nd Place */}
+                  {sortedTeams[1] && (
+                    <div className="flex flex-col items-center">
+                      <div className="text-slate-300 font-bold mb-2">{sortedTeams[1].name}</div>
+                      <div className="text-sm font-semibold text-slate-400 mb-2">{sortedTeams[1].score} pts</div>
+                      <div className="w-24 md:w-36 bg-gradient-to-t from-slate-700 to-slate-500 rounded-t-xl h-44 flex flex-col justify-end p-4 border-t-4 border-slate-300 shadow-xl">
+                        <span className="text-4xl font-black text-slate-900">2º</span>
+                        <span className="text-xs font-bold text-slate-900 uppercase mt-1">Plata</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 1st Place */}
+                  {sortedTeams[0] && (
+                    <div className="flex flex-col items-center -mt-8">
+                      <div className="text-2xl font-black text-amber-300 mb-2 animate-bounce">👑 {sortedTeams[0].name}</div>
+                      <div className="text-base font-bold text-amber-400 mb-2">{sortedTeams[0].score} pts</div>
+                      <div className="w-28 md:w-44 bg-gradient-to-t from-amber-600 via-yellow-500 to-amber-400 rounded-t-xl h-60 flex flex-col justify-end p-4 border-t-4 border-yellow-200 shadow-2xl shadow-amber-500/30">
+                        <span className="text-6xl font-black text-slate-950">1º</span>
+                        <span className="text-sm font-black text-slate-950 uppercase tracking-widest mt-1">ORO IBP</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 3rd Place */}
+                  {sortedTeams[2] && (
+                    <div className="flex flex-col items-center">
+                      <div className="text-amber-600 font-bold mb-2">{sortedTeams[2].name}</div>
+                      <div className="text-sm font-semibold text-slate-400 mb-2">{sortedTeams[2].score} pts</div>
+                      <div className="w-24 md:w-36 bg-gradient-to-t from-amber-800 to-amber-700 rounded-t-xl h-36 flex flex-col justify-end p-4 border-t-4 border-amber-600 shadow-xl">
+                        <span className="text-4xl font-black text-slate-950">3º</span>
+                        <span className="text-xs font-bold text-slate-950 uppercase mt-1">Bronce</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="p-4 bg-slate-950/60 rounded-xl max-w-2xl mx-auto border border-slate-800">
+                  <h4 className="text-sm font-bold text-cyan-400 mb-2">Resumen Ejecutivo de Desempeño Empresarial</h4>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    El equipo <strong className="text-amber-400">{sortedTeams[0]?.name}</strong> ha demostrado la mayor madurez operacional alineando ventas, operaciones, inventario y finanzas bajo el paradigma IBP de horizonte extendido.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              /* Standard Leaderboard & Metrics Grid */
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Main Leaderboard */}
+                <div className="lg:col-span-2 bg-slate-900/80 rounded-2xl p-6 border border-slate-800 backdrop-blur shadow-xl">
+                  <h3 className="text-lg font-bold mb-4 flex items-center justify-between">
+                    <span className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping" />
+                      Clasificación General en Tiempo Real
+                    </span>
+                    <span className="text-xs text-slate-400 font-normal">Actualizado cada segundo</span>
+                  </h3>
+
+                  <div className="space-y-4">
+                    {sortedTeams.map((team, idx) => (
+                      <div 
+                        key={team.id}
+                        className="bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 transition-all hover:border-slate-700"
+                      >
+                        <div className="
